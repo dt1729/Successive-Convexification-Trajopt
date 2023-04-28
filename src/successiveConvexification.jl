@@ -49,7 +49,7 @@ function distance(p1::QuadrotorState, p2::QuadrotorState)
     return sqrt((p1.x - p2.x)^2 + (p1.y - p2.y)^2 + (p1.z - p2.z)^2)
 end
 
-function Linearisation(time::Float64, prevState::QuadrotorState, prevControl::QuadrotorControl)
+function Linearisation(prevState::QuadrotorState, prevControl::QuadrotorControl)
 
     A_t = zeros(Float64, 6, 6)
     B_t = zeros(Float64, 6, 3)
@@ -117,6 +117,32 @@ function TrajectoryTrackingLoop(referenceTrajectory::SVector, currentState::Quad
 
 end 
 
+function f(states::Matrix, control::Matrix)
+    
+    ans = zeros(6,100)
+    ans[:,1] = states[:,1]
+    
+    for i in 2:100
+    
+        ans[1,i] = state[1, i-1] + control[1,i-1]*sin(state[4,i-1])*cos(state[5,i-1])*δ_t
+        ans[2,i] = state[2, i-1] + control[1,i-1]*sin(state[4,i-1])*cos(state[5,i-1])*δ_t
+        ans[3,i] = state[3, i-1] + control[1,i-1]*sin(state[5,i-1])*δ_t
+        ans[4,i] = state[4, i-1] + control[2,i-1]*δ_t
+        ans[5,i] = state[5, i-1] + control[3,i-1]*δ_t
+        ans[6,i] = state[6, i-1] + 0.0
+    
+    end 
+
+    return ans
+
+end
+
+function J(states::Matrix, control::Matrix, λ::Float64, D::Variable, W::Variable)
+    tau = states - f(states, control)
+    return sumsquares(P*evaluate(D)) + sumsquares(Q*evaluate(W)) + λ * maximum([sum(abs.(tau[:,i])) for i in 1:100])
+end
+
+
 function MPC_SuccessiveConvexification(referenceState::QuadrotorState, previousState::QuadrotorState, controlAction::QuadrotorControl) 
     
     # Issi ke andar integration bhi kar dena
@@ -124,35 +150,58 @@ function MPC_SuccessiveConvexification(referenceState::QuadrotorState, previousS
     #        predicted_change = last_nonlinear_cost - linear_cost  # delta_L
     
     # Step 1 
-    X_prev = Variable(6,100)
-    U_prev = Variable(3,99)
+
+    X_prev = zeros(6,100)
+    U_prev = zeros(3,99)
     λ = 1e5
+    Δ = 10.0
+    δ_t = 0.1
+    ρ_zero = 0.1 
+    ρ_one  = 0.4
+    ρ_two  = 0.5 
+    α = 1.5
+    count = 0
     
     while count < 20 
+
         D = Variable(6,100)
         W = Variable(3,99)
-        v = Variable(6,99)
+        v = Variable(6,100)
 
-        p = sumofsquares(P*D) + sumofsquares(Q*W) + λ * sum(abs(v))
+        
+        A, B, D_t = Linearisation(prevState, prevControl)
+        
+        constraints = Constraint[X_prev[1,i] + D[1,i] >= 0  for i in 1:100]
+        
+        for i in 1:100
 
-        problem = minimize(p, constraints)
-        
-        constraints = Constraint[
-           0 <=  X_prev[j,i] + D[j,i] <= 10.0 for j in 1:3 for i in 1:100,
-          -1 <=  U_prev[1,i] + W[1,i] <= 1    for i in 1:99,
-          -0.3 <= U_prev[2,i] + W[2,i] <= 0.3 for i in 1:99,
-          -0.3 <= U_prev[3,i] + W[3,i] <= 0.3 for i in 1:99,
-            D[:,i+1] == A*D[:,i] + B*W[:,i] +  v[:,i] + D for i in 1:99,
-            max(w) <= Δ        
-        ]
-        
+            for j in 1:3
+                push!(constraints,0 <= X_prev[j,i] + D[j,i])
+                push!(constraints,10 >= X_prev[j,i] + D[j,i])
+            end
+
+            if i < 100
+                push!(constraints,-1 <=  U_prev[1,i] + W[1,i])
+                push!(constraints, 1 >=  U_prev[1,i] + W[1,i])
+                push!(constraints,-0.3 <= U_prev[2,i] + W[2,i])
+                push!(constraints, 0.3 >= U_prev[2,i] + W[2,i])
+                push!(constraints,-0.3 <= U_prev[3,i] + W[3,i])
+                push!(constraints,0.3  >= U_prev[3,i] + W[3,i])
+                push!(constraints, D[:,i+1] == A*D[:,i] + B*W[:,i] +  v[:,i] + D_t) 
+                push!(constraints, norm(W[:,i], Inf) <= Δ)                   
+            end
+
+        end
+
+        problem = minimize(sumsquares(P*D) + sumsquares(Q*W) + λ * sum(abs(v)), constraints)
+
         solve!(problem, SCS.Optimizer; silent_solver=True)
         
-        ΔJ = J(X_prev + D, U_prev + W) - J()
-        ΔL = J(X_prev + D, U_prev + W) - L()
+        ΔJ = J(X_prev + evaluate(D), U_prev + evaluate(W), λ, D, W) - J(X_prev, U_prev, λ, D, W)
+        tt = evaluate(v)
+        ΔL = J(X_prev + evaluate(D), U_prev + evaluate(W), λ, D, W) - (sumsquares(P*evaluate(D)) + sumsquares(Q*evaluate(W)) + λ * maximum([sum(abs.(tt[:,i])) for i in 1:100]))
 
         if ΔL <= 0.01 
-            ans = [X, U]
             break 
         else
             ratio = ΔJ/ΔL
@@ -162,8 +211,8 @@ function MPC_SuccessiveConvexification(referenceState::QuadrotorState, previousS
             Δ = Δ/α
             continue
         else
-            X_prev = X_prev + D
-            U_prev = U_prev + W
+            X_prev = X_prev + evaluate(D)
+            U_prev = U_prev + evaluate(W)
             if ratio < ρ_one
                 Δ = Δ/α
             else if ρ_1 <= ratio && ratio < ρ_two
@@ -175,8 +224,18 @@ function MPC_SuccessiveConvexification(referenceState::QuadrotorState, previousS
         Δ = max(Δ, Δ_min) 
         count  = count + 1
     end
-    
-    outputControl = QuadrotorControl(0,0,0)
 
+    outputControl = QuadrotorControl(U_prev[1,1], U_prev[2,1], U_prev[3,1])
+    currentState  = QuadrotorState(0,0,0,0,0,0)
+
+    currentState.x = state[1, 1] + U_prev[1,1]*sin(U_prev[2,1]*δ_t)*cos(U_prev[3,1]*δ_t)*δ_t
+    currentState.y = state[2, 1] + U_prev[1,1]*sin(U_prev[2,1]*δ_t)*cos(U_prev[3,1]*δ_t)*δ_t
+    currentState.z = state[3, 1] + U_prev[1,1]*sin(U_prev[3,1]*δ_t)*δ_t
+    currentState.φ = state[4, 1] + U_prev[2,1]*δ_t
+    currentState.θ = state[5, 1] + U_prev[3,1]*δ_t
+    currentState.ψ = state[6, 1] + 0.0
+        
     return currentState, outputControl
 end
+
+MPC_SuccessiveConvexification(QuadrotorState(1,1,1,0.1,0.1,0), QuadrotorState(0,0,0,0.0,0.0,0), QuadrotorControl(0,0,0))
